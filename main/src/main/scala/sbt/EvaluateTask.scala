@@ -9,7 +9,6 @@ package sbt
 
 import java.io.File
 import java.util.concurrent.atomic.AtomicReference
-
 import sbt.Def.{ ScopedKey, Setting, dummyState }
 import sbt.Keys.{ TaskProgress => _, name => _, _ }
 import sbt.Project.richInitializeTask
@@ -18,10 +17,13 @@ import sbt.SlashSyntax0._
 import sbt.internal.Aggregation.KeyValue
 import sbt.internal.TaskName._
 import sbt.internal._
+import sbt.internal.langserver.ErrorCodes
 import sbt.internal.util.{ Terminal => ITerminal, _ }
 import sbt.librarymanagement.{ Resolver, UpdateReport }
 import sbt.std.Transform.DummyTaskMap
 import sbt.util.{ Logger, Show }
+import sbt.BuildSyntax._
+import sbt.internal.bsp.BuildTargetIdentifier
 
 import scala.annotation.nowarn
 import scala.Console.RED
@@ -142,14 +144,19 @@ final case class PluginData(
     definitionClasspath: Seq[Attributed[File]],
     resolvers: Option[Vector[Resolver]],
     report: Option[UpdateReport],
-    scalacOptions: Seq[String]
+    scalacOptions: Seq[String],
+    unmanagedSourceDirectories: Seq[File],
+    unmanagedSources: Seq[File],
+    managedSourceDirectories: Seq[File],
+    managedSources: Seq[File],
+    buildTarget: Option[BuildTargetIdentifier]
 ) {
   val classpath: Seq[Attributed[File]] = definitionClasspath ++ dependencyClasspath
 }
 
 object PluginData {
   private[sbt] def apply(dependencyClasspath: Def.Classpath): PluginData =
-    PluginData(dependencyClasspath, Nil, None, None, Nil)
+    PluginData(dependencyClasspath, Nil, None, None, Nil, Nil, Nil, Nil, Nil, None)
 }
 
 object EvaluateTask {
@@ -367,11 +374,13 @@ object EvaluateTask {
       }
     }
 
-    for ((key, msg, ex) <- keyed if (msg.isDefined || ex.isDefined)) {
+    for ((key, msg, ex) <- keyed if msg.isDefined || ex.isDefined) {
       val msgString = (msg.toList ++ ex.toList.map(ErrorHandling.reducedToString)).mkString("\n\t")
       val log = getStreams(key, streams).log
       val display = contextDisplay(state, ITerminal.isColorEnabled)
-      log.error("(" + display.show(key) + ") " + msgString)
+      val errorMessage = "(" + display.show(key) + ") " + msgString
+      state.respondError(ErrorCodes.InternalError, errorMessage)
+      log.error(errorMessage)
     }
   }
 

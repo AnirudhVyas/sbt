@@ -35,7 +35,7 @@ import sbt.Scope.{ GlobalScope, ThisScope, fillTaskAxis }
 import sbt.coursierint._
 import sbt.internal.CommandStrings.ExportStream
 import sbt.internal._
-import sbt.internal.classpath.{ AlternativeZincUtil, ClassLoaderCache }
+import sbt.internal.classpath.AlternativeZincUtil
 import sbt.internal.inc.JavaInterfaceUtil._
 import sbt.internal.inc.classpath.{ ClasspathFilter, ClasspathUtil }
 import sbt.internal.inc.{ CompileOutput, MappedFileConverter, Stamps, ZincLmUtil, ZincUtil }
@@ -332,13 +332,6 @@ object Defaults extends BuildCommon {
       turbo :== SysProp.turbo,
       usePipelining :== SysProp.pipelining,
       exportPipelining := usePipelining.value,
-      useScalaReplJLine :== false,
-      scalaInstanceTopLoader := {
-        // the JLineLoader contains the SbtInterfaceClassLoader
-        if (!useScalaReplJLine.value)
-          classOf[org.jline.terminal.Terminal].getClassLoader // the JLineLoader
-        else classOf[Compilers].getClassLoader // the SbtInterfaceClassLoader
-      },
       useSuperShell := { if (insideCI.value) false else ITerminal.console.isSupershellEnabled },
       superShellThreshold :== SysProp.supershellThreshold,
       superShellMaxTasks :== SysProp.supershellMaxTasks,
@@ -429,7 +422,7 @@ object Defaults extends BuildCommon {
         LanguageServerProtocol.handler(fileConverter.value),
         BuildServerProtocol.handler(
           loadedBuild.value,
-          bspWorkspace.value,
+          bspFullWorkspace.value,
           sbtVersion.value,
           semanticdbEnabled.value,
           semanticdbVersion.value
@@ -667,6 +660,23 @@ object Defaults extends BuildCommon {
 
   // This is included into JvmPlugin.projectSettings
   def compileBase = inTask(console)(compilersSetting :: Nil) ++ compileBaseGlobal ++ Seq(
+    useScalaReplJLine :== false,
+    scalaInstanceTopLoader := {
+      val topLoader = if (!useScalaReplJLine.value) {
+        // the JLineLoader contains the SbtInterfaceClassLoader
+        classOf[org.jline.terminal.Terminal].getClassLoader
+      } else classOf[Compilers].getClassLoader // the SbtInterfaceClassLoader
+
+      // Scala 2.10 shades jline in the console so we need to make sure that it loads a compatible
+      // jansi version. Because of the shading, console does not work with the thin client for 2.10.x.
+      if (scalaVersion.value.startsWith("2.10.")) new ClassLoader(topLoader) {
+        override protected def loadClass(name: String, resolve: Boolean): Class[_] = {
+          if (name.startsWith("org.fusesource")) throw new ClassNotFoundException(name)
+          super.loadClass(name, resolve)
+        }
+      }
+      else topLoader
+    },
     scalaInstance := scalaInstanceTask.value,
     crossVersion := (if (crossPaths.value) CrossVersion.binary else CrossVersion.disabled),
     pluginCrossBuild / sbtBinaryVersion := binarySbtVersion(
@@ -745,7 +755,7 @@ object Defaults extends BuildCommon {
         scalaSrcDir.getParentFile / s"${scalaSrcDir.name}-$sv",
         scalaSrcDir.getParentFile / s"${scalaSrcDir.name}-$epochVersion",
         javaSrcDir,
-      )
+      ).distinct
     else
       Seq(scalaSrcDir, javaSrcDir)
   }
@@ -959,6 +969,13 @@ object Defaults extends BuildCommon {
         Vector("-Ypickle-java", "-Ypickle-write", converter.toPath(earlyOutput.value).toString) ++ old
       else old
     },
+    scalacOptions := {
+      val old = scalacOptions.value
+      if (sbtPlugin.value && VersionNumber(scalaVersion.value)
+            .matchesSemVer(SemanticSelector("=2.12 >=2.12.13")))
+        old ++ Seq("-Wconf:cat=unused-nowarn:s")
+      else old
+    },
     persistJarClasspath :== true,
     classpathEntryDefinesClassVF := {
       (if (persistJarClasspath.value) classpathDefinesClassCache.value
@@ -975,12 +992,17 @@ object Defaults extends BuildCommon {
     selectMainClass := mainClass.value orElse askForMainClass(discoveredMainClasses.value),
     run / mainClass := (run / selectMainClass).value,
     mainClass := {
-      val logWarning = state.value.currentCommand
-        .flatMap(_.commandLine.split(" ").headOption.map(_.trim))
-        .fold(true) {
-          case "run" | "runMain" => false
-          case _                 => true
-        }
+      val logWarning = state.value.currentCommand.forall(!_.commandLine.split(" ").exists {
+        case "run" | "runMain" => true
+        case r =>
+          r.split("/") match {
+            case Array(parts @ _*) =>
+              parts.lastOption match {
+                case Some("run" | "runMain") => true
+                case _                       => false
+              }
+          }
+      })
       pickMainClassOrWarn(discoveredMainClasses.value, streams.value.log, logWarning)
     },
     runMain := foregroundRunMainTask.evaluated,
@@ -1077,13 +1099,12 @@ object Defaults extends BuildCommon {
             val libraryJars = allJars.filter(_.getName == "scala-library.jar")
             allJars.filter(_.getName == "scala-compiler.jar") match {
               case Array(compilerJar) if libraryJars.nonEmpty =>
-                val cache = state.value.extendedClassLoaderCache
-                mkScalaInstance(
+                makeScalaInstance(
                   version,
                   libraryJars,
                   allJars,
                   Seq.empty,
-                  cache,
+                  state.value,
                   scalaInstanceTopLoader.value
                 )
               case _ => ScalaInstance(version, scalaProvider)
@@ -1135,33 +1156,24 @@ object Defaults extends BuildCommon {
         .flatMap(_.artifacts.map(_._2))
     val libraryJars = ScalaArtifacts.libraryIds(sv).map(file)
 
-    mkScalaInstance(
+    makeScalaInstance(
       sv,
       libraryJars,
       allCompilerJars,
       allDocJars,
-      state.value.extendedClassLoaderCache,
+      state.value,
       scalaInstanceTopLoader.value,
     )
   }
-  private[this] def mkScalaInstance(
+  def makeScalaInstance(
       version: String,
       libraryJars: Array[File],
       allCompilerJars: Seq[File],
       allDocJars: Seq[File],
-      classLoaderCache: ClassLoaderCache,
+      state: State,
       topLoader: ClassLoader,
   ): ScalaInstance = {
-    // Scala 2.10 shades jline in the console so we need to make sure that it loads a compatible
-    // jansi version. Because of the shading, console does not work with the thin client for 2.10.x.
-    val jansiExclusionLoader = if (version.startsWith("2.10.")) new ClassLoader(topLoader) {
-      override protected def loadClass(name: String, resolve: Boolean): Class[_] = {
-        if (name.startsWith("org.fusesource")) throw new ClassNotFoundException(name)
-        super.loadClass(name, resolve)
-      }
-    }
-    else topLoader
-
+    val classLoaderCache = state.extendedClassLoaderCache
     val compilerJars = allCompilerJars.filterNot(libraryJars.contains).distinct.toArray
     val docJars = allDocJars
       .filterNot(jar => libraryJars.contains(jar) || compilerJars.contains(jar))
@@ -1169,13 +1181,8 @@ object Defaults extends BuildCommon {
       .toArray
     val allJars = libraryJars ++ compilerJars ++ docJars
 
-    val libraryLoader = classLoaderCache(libraryJars.toList, jansiExclusionLoader)
-    val compilerLoader = classLoaderCache(
-      // It should be `compilerJars` but it would break on `3.0.0-M2` because of
-      // https://github.com/lampepfl/dotty/blob/d932af954ef187d7bdb87500d49ed0ff530bd1e7/sbt-bridge/src/xsbt/CompilerClassLoader.java#L108-L117
-      allCompilerJars.toList,
-      libraryLoader
-    )
+    val libraryLoader = classLoaderCache(libraryJars.toList, topLoader)
+    val compilerLoader = classLoaderCache(compilerJars.toList, libraryLoader)
     val fullLoader =
       if (docJars.isEmpty) compilerLoader
       else classLoaderCache(docJars.distinct.toList, compilerLoader)
@@ -1196,12 +1203,12 @@ object Defaults extends BuildCommon {
       case a: AutoCloseable => a.close()
       case _                =>
     }
-    mkScalaInstance(
+    makeScalaInstance(
       dummy.version,
       dummy.libraryJars,
       dummy.compilerJars,
       dummy.allJars,
-      state.value.extendedClassLoaderCache,
+      state.value,
       scalaInstanceTopLoader.value,
     )
   }
@@ -2107,7 +2114,11 @@ object Defaults extends BuildCommon {
           val projectName = name.value
           if (ScalaArtifacts.isScala3(sv)) {
             val project = if (config == Compile) projectName else s"$projectName-$config"
-            Seq("-project", project)
+            if (scalaVersion.value.startsWith("3.0.0")) {
+              Seq("-project", project)
+            } else {
+              compileOptions ++ Seq("-project", project)
+            }
           } else compileOptions
         },
         (TaskZero / key) := {
@@ -2561,11 +2572,8 @@ object Defaults extends BuildCommon {
   // 1. runnerSettings is added unscoped via JvmPlugin.
   // 2. In addition it's added scoped to run task.
   lazy val runnerSettings: Seq[Setting[_]] = Seq(runnerTask, forkOptions := forkOptionsTask.value)
-  private[this] lazy val newRunnerSettings: Seq[Setting[_]] = {
-    val unscoped: Seq[Def.Setting[_]] =
-      Seq(runner := ClassLoaders.runner.value, forkOptions := forkOptionsTask.value)
-    inConfig(Compile)(unscoped) ++ inConfig(Test)(unscoped)
-  }
+  private[this] lazy val newRunnerSettings: Seq[Setting[_]] =
+    Seq(runner := ClassLoaders.runner.value, forkOptions := forkOptionsTask.value)
 
   lazy val baseTasks: Seq[Setting[_]] = projectTasks ++ packageBase
 

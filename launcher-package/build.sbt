@@ -1,12 +1,10 @@
 import scala.util.control.Exception.catching
-import _root_.bintray.InternalBintrayKeys._
-import _root_.bintray.{BintrayRepo, Bintray}
 import NativePackagerHelper._
 import com.typesafe.sbt.packager.SettingsHelper._
 import DebianConstants._
 
 lazy val sbtOfflineInstall =
-  sys.props.getOrElse("sbt.build.offline", sys.env.getOrElse("sbt.build.offline", "true")) match {
+  sys.props.getOrElse("sbt.build.offline", sys.env.getOrElse("sbt.build.offline", "false")) match {
     case "true" | "1"  => true
     case "false" | "0" => false
     case _             => false
@@ -17,12 +15,18 @@ lazy val sbtIncludeSbtn =
     case "false" | "0" => false
     case _             => false
   }
+lazy val sbtIncludeSbtLaunch =
+  sys.props.getOrElse("sbt.build.includesbtlaunch", sys.env.getOrElse("sbt.build.includesbtlaunch", "true")) match {
+    case "true" | "1"  => true
+    case "false" | "0" => false
+    case _             => false
+  }
 lazy val sbtVersionToRelease = sys.props.getOrElse("sbt.build.version", sys.env.getOrElse("sbt.build.version", {
         sys.error("-Dsbt.build.version must be set")
       }))
 
 lazy val scala210 = "2.10.7"
-lazy val scala212 = "2.12.10"
+lazy val scala212 = "2.12.14"
 lazy val scala210Jline = "org.scala-lang" % "jline" % scala210
 lazy val jansi = {
   if (sbtVersionToRelease startsWith "1.") "org.fusesource.jansi" % "jansi" % "1.12"
@@ -30,7 +34,7 @@ lazy val jansi = {
 }
 lazy val scala212Compiler = "org.scala-lang" % "scala-compiler" % scala212
 lazy val scala212Jline = "jline" % "jline" % "2.14.6"
-// use the scala-xml version used by the compiler not the latest: https://github.com/scala/scala/blob/v2.12.10/versions.properties#L22
+// use the scala-xml version used by the compiler not the latest: https://github.com/scala/scala/blob/v2.12.14/versions.properties#L21
 lazy val scala212Xml = "org.scala-lang.modules" % "scala-xml_2.12" % "1.0.6"
 lazy val sbtActual = "org.scala-sbt" % "sbt" % sbtVersionToRelease
 
@@ -56,7 +60,8 @@ lazy val bintrayRpmExperimentalUrl = settingKey[String]("API point for RPM exper
 lazy val bintrayGenericPackagesUrl = settingKey[String]("API point for generic packages")
 lazy val bintrayTripple = settingKey[(String, String, String)]("id, url, and pattern")
 
-val bintrayLinuxPattern = "[module]/[revision]/[module]-[revision].[ext]"
+val artifactoryLinuxPattern = "[module]-[revision].[ext]"
+val artifactoryDebianPattern = "[module]-[revision].[ext];deb.distribution=all;deb.component=main;deb.architecture=all"
 val bintrayGenericPattern = "[module]/[revision]/[module]/[revision]/[module]-[revision].[ext]"
 val bintrayReleaseAllStaged = TaskKey[Unit]("bintray-release-all-staged", "Release all staged artifacts on bintray.")
 val windowsBuildId = settingKey[Int]("build id for Windows installer")
@@ -72,15 +77,16 @@ val x86MacImageName = s"sbtn-$x86MacPlatform"
 val x86LinuxImageName = s"sbtn-$x86LinuxPlatform"
 val x86WindowsImageName = s"sbtn-$x86WindowsPlatform.exe"
 
+organization in ThisBuild := "org.scala-sbt"
+version in ThisBuild := "0.1.0"
+
 // This build creates a SBT plugin with handy features *and* bundles the SBT script for distribution.
 val root = (project in file(".")).
   enablePlugins(UniversalPlugin, LinuxPlugin, DebianPlugin, RpmPlugin, WindowsPlugin,
-    UniversalDeployPlugin, DebianDeployPlugin, RpmDeployPlugin, WindowsDeployPlugin).
+    UniversalDeployPlugin, RpmDeployPlugin, WindowsDeployPlugin).
   settings(
-    organization := "org.scala-sbt",
     name := "sbt-launcher-packaging",
     packageName := "sbt",
-    version := "0.1.0",
     crossTarget := target.value,
     clean := {
       val _ = (clean in dist).value
@@ -92,7 +98,6 @@ val root = (project in file(".")).
         case _ => Nil
       }
     },
-    useGpg := true,
     usePgpKeyHex("642AC823"),
     pgpSecretRing := file(s"""${sys.props("user.home")}""") / ".ssh" / "scalasbt.key",
     pgpPublicRing := file(s"""${sys.props("user.home")}""") / ".ssh" / "scalasbt.pub",
@@ -113,6 +118,7 @@ val root = (project in file(".")).
       // TODO - GPG Trust validation.
       file
     },
+    // update sbt.sh at root
     sbtnVersion := "1.4.7",
     sbtnJarsBaseUrl := "https://github.com/sbt/sbtn-dist/releases/download",
     sbtnJarsMappings := {
@@ -197,6 +203,9 @@ val root = (project in file(".")).
     addPackage(Debian, packageBin in Debian, "deb"),
     debianNativeBuildOptions in Debian := Seq("-Zgzip", "-z3"),
 
+    // use the following instead of DebianDeployPlugin to skip changelog
+    makeDeploymentSettings(Debian, packageBin in Debian, "deb"),
+
     // RPM SPECIFIC
     rpmRelease := debianBuildId.value.toString,
     version in Rpm := {
@@ -247,6 +256,8 @@ val root = (project in file(".")).
 
     // Universal ZIP download install.
     packageName in Universal := packageName.value, // needs to be set explicitly due to a bug in native-packager
+    name in Windows := packageName.value,
+    packageName in Windows := packageName.value,
     version in Universal := sbtVersionToRelease,
 
     mappings in Universal += {
@@ -281,13 +292,16 @@ val root = (project in file(".")).
         case (k, v) => (k, v)
       }
     },
-
-    mappings in Universal ++= {
-      val launchJar = sbtLaunchJar.value
-      Seq(
-        launchJar -> "bin/sbt-launch.jar"
-      ) ++ sbtnJarsMappings.value
-    },
+    mappings in Universal ++= (Def.taskDyn {
+      if (sbtIncludeSbtLaunch)
+        Def.task {
+          Seq(
+            sbtLaunchJar.value -> "bin/sbt-launch.jar"
+          )
+        }
+      else Def.task { Seq[(File, String)]() }
+    }).value,
+    mappings in Universal ++= sbtnJarsMappings.value,
     mappings in Universal ++= (Def.taskDyn {
       if (sbtOfflineInstall && sbtVersionToRelease.startsWith("1."))
         Def.task {
@@ -352,54 +366,31 @@ def makePublishToForConfig(config: Configuration) = {
   // Add the publish to and ensure global resolvers has the resolver we just configured.
   inConfig(config)(Seq(
     name := "sbt",
-    bintrayOrganization := {
-      // offline installation exceeds 50MB file limit for OSS organization
-      if (sbtOfflineInstall) Some("sbt")
-      else Some("sbt")
-    },
-    bintrayRepository := bintrayTripple.value._1,
-    bintrayRepo := Bintray.cachedRepo(bintrayEnsureCredentials.value,
-      bintrayOrganization.value,
-      bintrayRepository.value),
-    bintrayPackage := "sbt",
-
-    bintrayDebianUrl             := s"https://api.bintray.com/content/${bintrayOrganization.value.get}/debian/",
-    bintrayDebianExperimentalUrl := s"https://api.bintray.com/content/${bintrayOrganization.value.get}/debian-experimental/",
-    bintrayRpmUrl                := s"https://api.bintray.com/content/${bintrayOrganization.value.get}/rpm/",
-    bintrayRpmExperimentalUrl    := s"https://api.bintray.com/content/${bintrayOrganization.value.get}/rpm-experimental/",
-    bintrayGenericPackagesUrl    := s"https://api.bintray.com/content/${bintrayOrganization.value.get}/native-packages/",
+    bintrayDebianUrl             := s"https://scala.jfrog.io/artifactory/debian/",
+    bintrayDebianExperimentalUrl := s"https://scala.jfrog.io/artifactory/debian-experimental/",
+    bintrayRpmUrl                := s"https://scala.jfrog.io/artifactory/rpm/",
+    bintrayRpmExperimentalUrl    := s"https://scala.jfrog.io/artifactory/rpm-experimental/",
+    bintrayGenericPackagesUrl    := s"https://scala.jfrog.io/artifactory/native-packages/",
     bintrayTripple := {
       config.name match {
-        case Debian.name if isExperimental => ("debian-experimental", bintrayDebianExperimentalUrl.value, bintrayLinuxPattern)
-        case Debian.name                   => ("debian", bintrayDebianUrl.value, bintrayLinuxPattern)
-        case Rpm.name if isExperimental    => ("rpm-experimental", bintrayRpmExperimentalUrl.value, bintrayLinuxPattern)
-        case Rpm.name                      => ("rpm", bintrayRpmUrl.value, bintrayLinuxPattern)
-        case _                             => ("native-packages", bintrayGenericPackagesUrl.value, bintrayGenericPattern)
+        case Debian.name if isExperimental => ("debian-experimental", bintrayDebianExperimentalUrl.value, artifactoryDebianPattern)
+        case Debian.name                   => ("debian", bintrayDebianUrl.value, artifactoryDebianPattern)
+        case Rpm.name if isExperimental    => ("rpm-experimental", bintrayRpmExperimentalUrl.value, artifactoryLinuxPattern)
+        case Rpm.name                      => ("rpm", bintrayRpmUrl.value, artifactoryLinuxPattern)
       }
     },
     publishTo := {
       val (id, url, pattern) = bintrayTripple.value
       val resolver = Resolver.url(id, new URL(url))(Patterns(pattern))
       Some(resolver)
-    },
-    bintrayReleaseAllStaged := bintrayRelease(bintrayRepo.value, bintrayPackage.value, version.value, sLog.value)
-    // Uncomment to release right after publishing
-    // publish <<= (publish, bintrayRepo, bintrayPackage, version, sLog) apply { (publish, bintrayRepo, bintrayPackage, version, sLog) =>
-    //   for {
-    //     pub <- publish
-    //     repo <- bintrayRepo
-    //   } yield bintrayRelease(repo, bintrayPackage, version, sLog)
-    // }
+    }
   )) ++ Seq(
      resolvers ++= ((publishTo in config) apply (_.toSeq)).value
   )
 }
 
 def publishToSettings =
-  Seq[Configuration](Debian, Universal, Windows, Rpm) flatMap makePublishToForConfig
-
-def bintrayRelease(repo: BintrayRepo, pkg: String, version: String, log: Logger): Unit =
-  repo.release(pkg, version, log)
+  Seq[Configuration](Debian, Rpm) flatMap makePublishToForConfig
 
 def downloadUrl(uri: URI, out: File): Unit =
   {
